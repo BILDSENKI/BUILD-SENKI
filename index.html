@@ -337,40 +337,95 @@ const Engine = (() => {
     }
     return score+(pasha(s,3-side)?100:0)-(pasha(s,side)?100:0);
   }
-  function chooseDifficulty(s,side,level='normal',budgetMs=850){
-    if(!Object.hasOwn(difficultyNames,level))throw new Error('CPUの強さを選択してください');
-    const settings={beginner:[1,45],easy:[1,100],normal:[2,450],hard:[4,700],supreme:[8,850]},[maxDepth,limit]=settings[level];
-    const deadline=performance.now()+Math.max(1,Math.min(budgetMs,limit)),STOP={};
+  function positionKey(s){return s.turn+'|'+s.pieces.map(p=>[p.id,p.type,p.side,p.x,p.y,p.facing,p.reversed?1:0].join(',')).sort().join(';')+'|'+[1,2].map(side=>s.back[side]?s.back[side].x+','+s.back[side].y:'-').join(';');}
+  const cpuSettings={
+    beginner:{depth:1,time:35,q:0,safety:false,activity:1,repeat:15},
+    easy:{depth:1,time:85,q:1,safety:true,activity:1,repeat:30},
+    normal:{depth:2,time:300,q:2,safety:true,activity:2,repeat:65},
+    hard:{depth:4,time:650,q:3,safety:true,activity:3,repeat:100},
+    supreme:{depth:7,time:850,q:3,safety:true,activity:4,repeat:150}
+  };
+  function chooseDifficulty(s,side,level='normal',budgetMs=850,context={},onProgress=()=>{}){
+    const cfg=cpuSettings[level];if(!cfg)throw new Error('CPUの強さを選択してください');
+    const start=performance.now(),deadline=start+Math.max(1,Math.min(budgetMs,cfg.time)),STOP={};
+    const stats={level,nodes:0,qnodes:0,depth:0,ttHits:0,elapsedMs:0},tt=new Map(),qtable=new Map(),killers=new Map(),history=new Map(),visits=new Map();
+    for(const key of context.positions||[])visits.set(key,(visits.get(key)||0)+1);
     const check=()=>{if(performance.now()>=deadline)throw STOP;};
-    const moves=all(s,side);if(!moves.length)return null;
-    const order=(pos,m)=>{const victim=at(pos,m.x,m.y),piece=pos.pieces.find(p=>p.id===m.id);return (victim?value[T[victim.type].group]*12:0)-(T[piece.type].group==='lord'?90:0)-(piece.prevX===m.x&&piece.prevY===m.y?35:0)+(4-Math.abs(m.x-4));};
-    moves.sort((a,b)=>order(s,b)-order(s,a));let best=moves[0];
-    const evaluate=pos=>{
-      if(isDraw(pos))return 0;
-      if(level==='beginner'){let total=0;for(const p of pos.pieces)if(T[p.type].group!=='lord')total+=(p.side===side?1:-1)*(value[T[p.type].group]*10+(p.side===1?8-p.y:p.y)*8);return total;}
-      return positionScore(pos,side);
-    };
-    function search(pos,turn,depth,alpha,beta,ply){
-      check();if(!lord(pos,side))return -1e8+ply;if(!lord(pos,3-side))return 1e8-ply;if(isDraw(pos))return 0;
-      if(build(pos,3-turn))return (3-turn===side?1:-1)*(1e8-ply);
-      check();if(build(pos,turn))return (turn===side?1:-1)*(1e8-ply);
-      if(depth===0)return evaluate(pos);
-      const opts=all(pos,turn);check();if(!opts.length)return (turn===side?-1:1)*(1e8-ply);
-      opts.sort((a,b)=>order(pos,b)-order(pos,a));let result=turn===side?-Infinity:Infinity;
-      for(const m of opts){check();const score=search(apply(pos,m),3-turn,depth-1,alpha,beta,ply+1);if(turn===side){result=Math.max(result,score);alpha=Math.max(alpha,result);}else{result=Math.min(result,score);beta=Math.min(beta,result);}if(alpha>=beta)break;}
-      return result;
-    }
-    // Keep a usable move from each completed iteration; incomplete deeper passes never replace it.
-    for(let depth=1;depth<=maxDepth;depth++){
-      let candidate=best,score=-Infinity;try{
-        moves.sort((a,b)=>(a===best?-1:b===best?1:order(s,b)-order(s,a)));
-        for(const m of moves){check();const next=apply(s,m);let v=search(next,3-side,depth-1,score,Infinity,1);
-          const p=s.pieces.find(p=>p.id===m.id);if(Math.abs(v)<1e7){if(p.prevX===m.x&&p.prevY===m.y)v-=2;if(T[p.type].group==='lord')v-=3+Math.max(0,(m.y-p.y)*(side===1?-1:1))*5;}
-          if(v>score){score=v;candidate=m;}if(depth===1)best=candidate;
+    const moveKey=m=>m.id+':'+m.x+','+m.y;
+    const scoreStatic=pos=>{
+      if(!cfg.safety){let total=0;for(const p of pos.pieces)if(T[p.type].group!=='lord')total+=(p.side===side?1:-1)*(value[T[p.type].group]*10+(p.side===1?8-p.y:p.y)*6);return total;}
+      let total=positionScore(pos,side);const kings={1:lord(pos,1),2:lord(pos,2)};
+      for(const p of pos.pieces){const g=T[p.type].group,sign=p.side===side?1:-1;if(g==='lord')continue;const enemy=kings[3-p.side];if(!enemy)continue;
+        const distance=Math.abs(p.x-enemy.x)+Math.abs(p.y-enemy.y);
+        const reach=raw(pos,p).filter(m=>m.c!=='y'||at(pos,m.x,m.y)).length;
+        total+=sign*cfg.activity*((16-distance)*3+Math.min(20,reach)*2);
+      }
+      if(cfg.activity>=2){for(const defender of [1,2]){const king=kings[defender];if(!king)continue;const danger=attackMap(pos,3-defender),pressure=around.filter(([dx,dy])=>inside(king.x+dx,king.y+dy)&&danger.has((king.x+dx)+','+(king.y+dy))).length;
+        if(pressure>=2){const exits=pseudoLegal(pos,king).filter(m=>!danger.has(m.x+','+m.y)).length,weight=level==='supreme'?4:level==='hard'?2:1;
+          total-=(defender===side?1:-1)*weight*pressure*(35+Math.max(0,3-exits)**2*30);
         }
-        best=candidate;if(score>9e7)break;
-      }catch(err){if(err!==STOP)throw err;break;}
+      }}
+      return total;
+    };
+    const terminal=(pos,ply)=>{
+      if(!lord(pos,side))return -1e8+ply;if(!lord(pos,3-side))return 1e8-ply;if(isDraw(pos))return 0;
+      if(build(pos,3-pos.turn))return (3-pos.turn===side?1:-1)*(1e8-ply);
+      if(build(pos,pos.turn))return (pos.turn===side?1:-1)*(1e8-ply);
+      return null;
+    };
+    const ordered=(pos,moves,pv,ply)=>{
+      const enemy=attackMap(pos,3-pos.turn),pieces=new Map(pos.pieces.map(p=>[p.id,p])),cells=new Map(pos.pieces.map(p=>[p.x+','+p.y,p]));
+      return moves.map(m=>{const k=moveKey(m),p=pieces.get(m.id),victim=cells.get(m.x+','+m.y),g=T[p.type].group;
+        let score=k===pv?1e9:0;score+=victim?value[T[victim.type].group]*100-value[g]:0;
+        if(cfg.safety&&enemy.has(m.x+','+m.y))score-=value[g]*3;
+        if(killers.get(ply)===k)score+=500;score+=history.get(k)||0;
+        if(p.prevX===m.x&&p.prevY===m.y)score-=40;if(g==='lord'&&!victim)score-=100;
+        return {m,score};}).sort((a,b)=>b.score-a.score).map(x=>x.m);
+    };
+    function quiet(pos,alpha,beta,remaining,ply){
+      check();if(cfg.q<2)return quietSearch(pos,alpha,beta,remaining,ply);
+      const key=positionKey(pos)+'|'+remaining+'|'+ply,entry=qtable.get(key),alpha0=alpha,beta0=beta;
+      if(entry){stats.ttHits++;if(entry.flag==='exact')return entry.value;if(entry.flag==='lower')alpha=Math.max(alpha,entry.value);else beta=Math.min(beta,entry.value);if(alpha>=beta)return entry.value;}
+      const value=quietSearch(pos,alpha,beta,remaining,ply);
+      if(qtable.size<18000)qtable.set(key,{value,flag:value<=alpha0?'upper':value>=beta0?'lower':'exact'});return value;
     }
+    function quietSearch(pos,alpha,beta,remaining,ply){
+      check();stats.qnodes++;const end=terminal(pos,ply);if(end!==null)return end;
+      const opts=all(pos,pos.turn);if(!opts.length)return pos.turn===side?-1e8+ply:1e8-ply;
+      const stand=scoreStatic(pos);if(remaining<=0)return stand;
+      const maximizing=pos.turn===side,inCheck=pasha(pos,pos.turn);let best=inCheck?(maximizing?-Infinity:Infinity):stand;
+      if(!inCheck){if(maximizing){if(best>=beta)return best;alpha=Math.max(alpha,best);}else{if(best<=alpha)return best;beta=Math.min(beta,best);}}
+      const candidates=inCheck?opts:opts.filter(m=>at(pos,m.x,m.y));
+      for(const m of ordered(pos,candidates,null,ply)){const v=quiet(apply(pos,m),alpha,beta,remaining-1,ply+1);if(maximizing){best=Math.max(best,v);alpha=Math.max(alpha,best);}else{best=Math.min(best,v);beta=Math.min(beta,best);}if(alpha>=beta)break;}
+      return best;
+    }
+    function search(pos,depth,alpha,beta,ply,path){
+      check();stats.nodes++;if(depth<=0)return quiet(pos,alpha,beta,cfg.q,ply);
+      const end=terminal(pos,ply);if(end!==null)return end;const key=positionKey(pos);
+      // Repetitions are an evaluation preference, never a new draw rule.
+      if(path.has(key))return scoreStatic(pos)-(pos.turn===side?1:-1)*cfg.repeat;
+      const alpha0=alpha,beta0=beta,entry=tt.get(key);if(entry&&entry.depth>=depth){stats.ttHits++;if(entry.flag==='exact')return entry.value;if(entry.flag==='lower')alpha=Math.max(alpha,entry.value);else beta=Math.min(beta,entry.value);if(alpha>=beta)return entry.value;}
+      const opts=all(pos,pos.turn);if(!opts.length)return pos.turn===side?-1e8+ply:1e8-ply;
+      const maximizing=pos.turn===side;let best=maximizing?-Infinity:Infinity,bestMove=null;path.add(key);
+      try{for(const m of ordered(pos,opts,entry?.move,ply)){check();const v=search(apply(pos,m),depth-1,alpha,beta,ply+1,path);if(maximizing?v>best:v<best){best=v;bestMove=moveKey(m);}if(maximizing)alpha=Math.max(alpha,best);else beta=Math.min(beta,best);if(alpha>=beta){if(!at(pos,m.x,m.y)){killers.set(ply,moveKey(m));history.set(moveKey(m),(history.get(moveKey(m))||0)+depth*depth);}break;}}}finally{path.delete(key);}
+      if(Math.abs(best)<9e7&&tt.size<18000)tt.set(key,{depth,value:best,move:bestMove,flag:best<=alpha0?'upper':best>=beta0?'lower':'exact'});
+      return best;
+    }
+    const moves=ordered(s,all(s,side),null,0);if(!moves.length)return null;
+    let best=moves[0],bestScore=-Infinity,lastProgress=start;const rootData=new Map(),rootDanger=pasha(s,side);
+    // Score every root move before deeper work; a timeout must not leave an arbitrary first move.
+    for(const m of moves){const next=apply(s,m),p=s.pieces.find(p=>p.id===m.id),capture=at(s,m.x,m.y);let bias=0;
+      if(!capture&&!rootDanger){if(p.prevX===m.x&&p.prevY===m.y)bias-=cfg.repeat;const recent=(context.moves||[]).filter(x=>x.side===side&&x.id===p.id).slice(-6);bias-=recent.filter(x=>x.x===m.x&&x.y===m.y).length*cfg.repeat;bias-=(visits.get(positionKey(next))||0)*cfg.repeat;if(T[p.type].group==='lord')bias-=15+Math.max(0,(m.y-p.y)*(side===1?-1:1))*20;}
+      let value=scoreStatic(next)+bias;if(!lord(next,3-side))value=1e8;
+      rootData.set(moveKey(m),{next,bias,value});if(value>bestScore){bestScore=value;best=m;}
+      const now=performance.now();if(rootData.size===1||now-lastProgress>=32){onProgress(best);lastProgress=now;}
+      if(now>=deadline){stats.elapsedMs=now-start;stats.score=bestScore;chooseDifficulty.lastSearch=stats;return best;}
+    }
+    onProgress(best);
+    try{for(let depth=1;depth<=cfg.depth;depth++){let candidate=best,score=-Infinity;const orderedRoots=[...moves].sort((a,b)=>a===best?-1:b===best?1:rootData.get(moveKey(b)).value-rootData.get(moveKey(a)).value);
+        for(const m of orderedRoots){check();const data=rootData.get(moveKey(m));let v=search(data.next,depth-1,score-data.bias,Infinity,1,new Set([positionKey(s)]));if(Math.abs(v)<9e7)v+=data.bias;data.value=v;if(v>score){score=v;candidate=m;}if(depth===1){best=candidate;bestScore=score;}if(v>9e7){best=m;bestScore=v;break;}}
+        best=candidate;bestScore=score;stats.depth=depth;onProgress(best);if(score>9e7)break;
+      }}catch(e){if(e!==STOP)throw e;}finally{stats.elapsedMs=performance.now()-start;stats.score=bestScore;chooseDifficulty.lastSearch=stats;}
     return best;
   }
   const slots=[
@@ -397,7 +452,7 @@ const Engine = (() => {
     return {pieces,turn,ply:0,back:{1:null,2:null}};
   }
   function isDraw(s){return s.pieces.length===2 && !!lord(s,1) && !!lord(s,2);}
-  return {isDraw,T,around,inside,at,lord,clone,raw,pseudoLegal,legal,all,apply,attacked,attackMap,pasha,enclosed,build,analyze,choose,chooseDifficulty,difficultyNames,positionScore,slots,available,defaults,validFormation,randomFormation,swapFoot,initial};
+  return {isDraw,T,around,inside,at,lord,clone,raw,pseudoLegal,legal,all,apply,attacked,attackMap,pasha,enclosed,build,analyze,choose,chooseDifficulty,difficultyNames,positionScore,positionKey,cpuSettings,slots,available,defaults,validFormation,randomFormation,swapFoot,initial};
 })();
 if(typeof module!=='undefined')module.exports=Engine;
 </script>
@@ -483,9 +538,9 @@ class SengokuScene {
     const src=document.querySelector('#materialAtlas')?.getAttribute('src');if(!src)return;
     const im=await new Promise(resolve=>{const a=new Image();a.onload=()=>resolve(a);a.onerror=()=>resolve(null);a.src=src;});if(!im)return;
     const M=this.materials,configs=[['stone',0,0,.022],['wood',1,0,.018],['iron',0,1,.004],['cloth',1,1,.003]];
-    for(const [key,x,y,bump] of configs){const c=document.createElement('canvas');c.width=c.height=512;c.getContext('2d').drawImage(im,x*im.width/2,y*im.height/2,im.width/2,im.height/2,0,0,512,512);const tex=new THREE.CanvasTexture(c);tex.colorSpace=THREE.SRGBColorSpace;tex.wrapS=tex.wrapT=THREE.RepeatWrapping;tex.anisotropy=Math.min(8,this.renderer.capabilities.getMaxAnisotropy());M[key].map=tex;const height=tex.clone();height.colorSpace=THREE.NoColorSpace;M[key].bumpMap=height;M[key].bumpScale=bump;M[key].needsUpdate=true;}
+    for(const [key,x,y,bump] of configs){const c=document.createElement('canvas');c.width=c.height=512;c.getContext('2d').drawImage(im,x*im.width/2,y*im.height/2,im.width/2,im.height/2,0,0,512,512);const tex=new THREE.CanvasTexture(c);tex.colorSpace=THREE.SRGBColorSpace;tex.wrapS=tex.wrapT=THREE.RepeatWrapping;tex.anisotropy=Math.min(8,this.renderer.capabilities.getMaxAnisotropy());M[key].map?.dispose();M[key].map=tex;const height=tex.clone();height.colorSpace=THREE.NoColorSpace;M[key].bumpMap=height;M[key].bumpScale=bump;M[key].needsUpdate=true;}
     M.stone.color.set('#a4a8a5');M.wood.color.set('#b7a58d');M.iron.color.set('#ddd5c5');M.iron.metalness=.32;M.iron.roughness=.69;M.iron.envMapIntensity=1.5;
-    for(const key of ['red','green','leather']){M[key].bumpMap=M.cloth.bumpMap;M[key].bumpScale=.004;M[key].needsUpdate=true;}this.markDirty();
+    for(const key of ['red','green','leather']){M[key].bumpMap=M.cloth.bumpMap;M[key].bumpScale=.004;M[key].needsUpdate=true;}this.markDirty(true);
   }
   symbolTexture(type,back=false){
     const key=type+(back?'back':'front');if(this.texCache.has(key))return this.texCache.get(key);
@@ -598,26 +653,31 @@ class SengokuScene {
     const top=this.mesh(g,new THREE.CircleGeometry(.373,96),new THREE.MeshBasicMaterial({map:this.tokenTexture(p.type,p.side),toneMapped:false}),0,.201,0);
     top.rotation.x=-Math.PI/2;top.rotation.z=p.facing===1?Math.PI:0;top.castShadow=false;
     const marker=this.mesh(g,new THREE.ConeGeometry(.035,.075,3),M.gold,0,.208,-.402);marker.rotation.x=-Math.PI/2;marker.castShadow=false;
-    g.userData={piece:p.id,type:p.type,topMark:top};g.traverse(o=>{o.userData.piece=p.id;});this.units.add(g);return g;
+    g.userData={piece:p.id,type:p.type,topMark:top,ownedMaterials:[top.material]};g.traverse(o=>{o.userData.piece=p.id;});this.units.add(g);return g;
   }
-  disposeNode(g){g.traverse(o=>{o.geometry?.dispose();});g.removeFromParent();}
+  disposeNode(g){for(const m of g.userData.ownedMaterials||[])m.dispose();g.traverse(o=>{o.geometry?.dispose();});g.removeFromParent();}
   update(state,selected,marks,threats,legalMoves,last,pending=null){
-    this.state=state;const alive=new Set(state.pieces.map(p=>p.id));for(const [id,n] of this.nodes)if(!alive.has(id)){this.disposeNode(n);this.nodes.delete(id);}
+    const moved=this.state!==state;this.state=state;const alive=new Set(state.pieces.map(p=>p.id));for(const [id,n] of this.nodes)if(!alive.has(id)){this.disposeNode(n);this.nodes.delete(id);}
     for(const p of state.pieces){let n=this.nodes.get(p.id);if(n&&n.userData.type!==p.type){this.disposeNode(n);n=null;}if(!n){n=this.makeUnit(p);this.nodes.set(p.id,n);}if(this.movingId!==p.id)n.position.set(p.x-4,0,p.y-4);n.rotation.y=p.facing===1?Math.PI:0;n.userData.topMark.visible=true;n.userData.topMark.rotation.z=p.facing===1?Math.PI:0;}
-    for(const child of [...this.highlights.children]){child.geometry?.dispose();child.material?.dispose();this.highlights.remove(child);}
+    if(this.highlightPools)for(const pool of this.highlightPools.values()){pool.used=0;for(const m of pool.items)m.visible=false;}
     const legal=new Set(legalMoves.map(m=>`${m.x},${m.y}`));
     for(const cell of this.boardCells){const {x,y}=cell.userData.square,key=`${x},${y}`,mark=marks.get(key);let color=threats.has(key)?'#080a0b':null;
-      if(color){const f=this.mesh(this.highlights,new THREE.PlaneGeometry(.965,.965),new THREE.MeshBasicMaterial({color}),x-4,.016,y-4);f.rotation.x=-Math.PI/2;f.castShadow=false;}
-      if(mark){const col={r:'#e7785e',b:'#6fbdde',y:'#e8c152'}[mark];const shape=this.mesh(this.highlights,new THREE.PlaneGeometry(.9,.9),new THREE.MeshBasicMaterial({color:col,transparent:true,opacity:threats.has(key)?.3:.5,depthWrite:false}),x-4,.025,y-4);shape.rotation.x=-Math.PI/2;shape.castShadow=false;this.squareOutline(x,y,col,.045);}
-      if(legal.has(key)){const dot=this.mesh(this.highlights,new THREE.CircleGeometry(.07,16),new THREE.MeshBasicMaterial({color:'#fff9dd'}),x-4,.033,y-4);dot.rotation.x=-Math.PI/2;dot.castShadow=false;}
+      if(color){this.highlight('plane',x-4,.016,y-4,color,.965,.965,1);}
+      if(mark){const col={r:'#e7785e',b:'#6fbdde',y:'#e8c152'}[mark];this.highlight('plane',x-4,.025,y-4,col,.9,.9,threats.has(key)?.3:.5);this.squareOutline(x,y,col,.045);}
+      if(legal.has(key)){this.highlight('dot',x-4,.033,y-4,'#fff9dd',1,1,1);}
     }
-    if(pending){this.squareOutline(pending.x,pending.y,'#fff2a9',.10);const ring=this.mesh(this.highlights,new THREE.RingGeometry(.25,.32,48),new THREE.MeshBasicMaterial({color:'#fff2a9',depthTest:false}),pending.x-4,.07,pending.y-4);ring.rotation.x=-Math.PI/2;ring.castShadow=false;ring.renderOrder=10;}
+    if(pending){this.squareOutline(pending.x,pending.y,'#fff2a9',.10);this.highlight('ring',pending.x-4,.07,pending.y-4,'#fff2a9',1,1,1);}
     const active=state.pieces.find(p=>p.id===selected);if(active)this.squareOutline(active.x,active.y,'#fff0b3',.08);
     if(last?.side===2){this.squareOutline(last.x,last.y,'#98daf1',.055);this.squareOutline(last.fromX,last.fromY,'#5791a5',.025);}
-    this.markDirty();
+    this.markDirty(moved);
   }
-  squareOutline(x,y,color,width){const m=this.mat(color);m.emissive.set(color);m.emissiveIntensity=.45;for(const [dx,dz,w,d] of [[0,-.46,.92,width],[0,.46,.92,width],[-.46,0,width,.92],[.46,0,width,.92]]){const o=this.box(this.highlights,w,.008,d,m,x-4+dx,.035,y-4+dz);o.castShadow=false;}}
-  markDirty(){this.dirty=true;this.renderer.shadowMap.needsUpdate=true;}
+  highlight(kind,x,y,z,color,w,h,opacity=1){
+    this.highlightPools??=new Map();const key=[kind,color,opacity].join(':');let pool=this.highlightPools.get(key);
+    if(!pool){const geometry=kind==='box'?new THREE.BoxGeometry(1,1,1):kind==='dot'?new THREE.CircleGeometry(.07,16):kind==='ring'?new THREE.RingGeometry(.25,.32,48):new THREE.PlaneGeometry(1,1);const material=kind==='box'?this.mat(color):new THREE.MeshBasicMaterial({color,transparent:opacity<1,opacity,depthWrite:opacity===1,depthTest:kind!=='ring'});if(kind==='box'){material.emissive.set(color);material.emissiveIntensity=.45;}pool={items:[],used:0,geometry,material};this.highlightPools.set(key,pool);}
+    let mesh=pool.items[pool.used++];if(!mesh){mesh=new THREE.Mesh(pool.geometry,pool.material);if(kind!=='box')mesh.rotation.x=-Math.PI/2;mesh.renderOrder=kind==='ring'?10:0;this.highlights.add(mesh);pool.items.push(mesh);}mesh.visible=true;mesh.position.set(x,y,z);mesh.scale.set(w,kind==='box'?.008:h,kind==='box'?h:1);return mesh;
+  }
+  squareOutline(x,y,color,width){for(const [dx,dz,w,d] of [[0,-.46,.92,width],[0,.46,.92,width],[-.46,0,width,.92],[.46,0,width,.92]])this.highlight('box',x-4+dx,.035,y-4+dz,color,w,d);}
+  markDirty(shadows=false){this.dirty=true;if(shadows)this.renderer.shadowMap.needsUpdate=true;}
   resize(){const w=this.host.clientWidth,h=this.host.clientHeight;if(!w||!h)return;const height=this.mode==='draw'?h*.44:h;const desired=this.quality==='high'?Math.max(2.5,Math.min(window.devicePixelRatio||1,3)):Math.min(window.devicePixelRatio||1,1.5);const ratio=Math.min(desired,Math.sqrt(3000000/(w*height)),2048/Math.max(w,height));this.renderer.setPixelRatio(ratio);this.renderer.setSize(w,height,false);this.canvas.dataset.renderScale=ratio.toFixed(2);this.aspect=w/height;this.placeCamera();}
   setQuality(value){this.quality=value;this.resize();}
   mount(host,mode='board'){host.appendChild(this.canvas);this.observer.unobserve(this.host);this.host=host;this.observer.observe(host);this.mode=mode;this.room.visible=mode!=='draw';this.scene.background=mode==='draw'?null:new THREE.Color('#141310');this.renderer.setClearAlpha(mode==='draw'?0:1);if(mode==='draw'){host.classList.remove('dice-open','dice-shake');this.dice.forEach(d=>d.visible=false);}this.active=true;this.board.visible=mode==='board';this.drawGroup.visible=mode==='draw';this.resize();}
@@ -631,8 +691,15 @@ class SengokuScene {
   setTop(value){this.top=value;if(value)this.yaw=0;for(const n of this.nodes.values())n.userData.topMark.visible=true;this.placeCamera();return value;}
   hit(event){
     if(this.mode!=='board')return null;const r=this.canvas.getBoundingClientRect();this.pointer.set((event.clientX-r.left)/r.width*2-1,-(event.clientY-r.top)/r.height*2+1);this.ray.setFromCamera(this.pointer,this.camera);
-    for(const h of this.ray.intersectObjects(this.units.children,true)){if(!h.object.visible)continue;const p=this.state?.pieces.find(p=>p.id===h.object.userData.piece);if(p)return {x:p.x,y:p.y};}
-    const hit=this.ray.intersectObjects(this.boardCells,false)[0];return hit?.object.userData.square||null;
+    // All current units are round tokens. Pick their cylinder volume, not tens of thousands of triangles.
+    const ray=this.ray.ray;let nearest=Infinity,picked=null;
+    for(const p of this.state?.pieces||[]){const cx=p.x-4,cz=p.y-4,ox=ray.origin.x-cx,oz=ray.origin.z-cz,dx=ray.direction.x,dz=ray.direction.z,A=dx*dx+dz*dz,B=2*(ox*dx+oz*dz),C=ox*ox+oz*oz-.425*.425;const ts=[];
+      if(A>1e-12){const disc=B*B-4*A*C;if(disc>=0){ts.push((-B-Math.sqrt(disc))/(2*A),(-B+Math.sqrt(disc))/(2*A));}}
+      if(Math.abs(ray.direction.y)>1e-12)for(const y of [.02,.215]){const t=(y-ray.origin.y)/ray.direction.y,x=ox+t*dx,z=oz+t*dz;if(x*x+z*z<=.425*.425)ts.push(t);}
+      for(const t of ts){const y=ray.origin.y+t*ray.direction.y;if(t>=0&&t<nearest&&y>=.01999&&y<=.21501){nearest=t;picked={x:p.x,y:p.y};}}
+    }
+    if(picked)return picked;
+    const t=(.008-ray.origin.y)/ray.direction.y;if(t<0||!Number.isFinite(t))return null;const x=ray.origin.x+t*ray.direction.x+4,y=ray.origin.z+t*ray.direction.z+4,ix=Math.round(x),iy=Math.round(y);return Engine.inside(ix,iy)&&Math.abs(x-ix)<=.491&&Math.abs(y-iy)<=.491?{x:ix,y:iy}:null;
   }
   bindCamera(){
     let start=null;const down=(e,forced=false)=>{if(e.button&&e.button!==0)return;const sq=forced?null:this.hit(e);start={x:e.clientX,y:e.clientY,yaw:this.yaw,elevation:this.elevation,square:sq,forced};e.currentTarget.setPointerCapture?.(e.pointerId);};
@@ -677,7 +744,7 @@ class SengokuScene {
     this.dice.forEach((die,i)=>{if(Array.isArray(die.material))die.material.forEach(m=>m.dispose());die.material=Array.from({length:6},(_,f)=>new THREE.MeshStandardMaterial({map:this.diceTexture(f===2?values[i]:(values[i]+f)%6+1),roughness:.78}));die.visible=true;die.rotation.set(0,i?.19:-.13,0);});
     return this.tween(340,u=>{this.dice.forEach((d,i)=>{d.position.y=.015+Math.sin(Math.PI*u)*.06;d.rotation.y=(i?.19:-.13)+(1-u)*.18;});this.renderer.shadowMap.needsUpdate=true;});
   }
-  dispose(){this.disposed=true;cancelAnimationFrame(this.raf);this.cancel();this.observer.disconnect();this.environmentTarget?.dispose();this.renderer.dispose();}
+  dispose(){this.disposed=true;cancelAnimationFrame(this.raf);this.cancel();this.observer.disconnect();for(const pool of this.highlightPools?.values()||[]){pool.geometry.dispose();pool.material.dispose();}this.environmentTarget?.dispose();this.renderer.dispose();}
 }
 </script>
 <script>/* Match telemetry is deliberately independent of rules, rendering and CPU search. */
@@ -795,7 +862,7 @@ const short={cavalryRaid:'遊',cavalryCharge:'突',ninjaShuriken:'手',ninjaWild
 function token(type,side=1,facing=-1){return `<span class="token ${side===2?'enemy':''} ${facing===1?'down':''}">${icon(E.T[type].icon)}<i class="direction"></i>${short[type]?`<span class="short">${short[type]}</span>`:''}</span>`;}
 
 let online=null,onlineRound=0,onlineStarted=0,onlineApplied=-1,onlineFinishing=false,onlineSync=Promise.resolve(),onlineLogged='';
-let difficulty='normal',cpuEffectUntil=0;
+let difficulty='normal',cpuEffectUntil=0,cpuContext={positions:[],moves:[]},cpuContextPly=-1;
 let drawBackdropURL=null;
 let scene=null,scenePromise=null,animating=false,epoch=0,drawnLords=null,drawRolls=null,drawDone=false;
 async function ensureScene(host,mode){
@@ -830,16 +897,20 @@ document.addEventListener('keydown',e=>{
 });
 // Audio is decoded lazily on the first user gesture. All sources are embedded.
 const audioData=JSON.parse($('#audioData').textContent),audio={},vol={bgm:.12,se:.8};
-let track='waiting',unlocked=false,muted=false;
+let track='waiting',unlocked=false,muted=false,audioSuspended=document.hidden;
 try{const v=JSON.parse(localStorage.getItem('sengoku-volume')||'null');if(v){vol.bgm=Math.max(0,Math.min(1,Number(v.bgm)||0));vol.se=Math.max(0,Math.min(1,Number(v.se)||0));}}catch{}
 function getAudio(key){if(!audio[key]){audio[key]=new Audio(audioData[key]);audio[key].id='audio-'+key;audio[key].hidden=true;document.body.appendChild(audio[key]);audio[key].loop=key!=='pasha';audio[key].preload='none';audio[key].addEventListener('error',()=>{$('#audioUnlock').textContent='音源を再生できませんでした';$('#audioUnlock').classList.add('show');});}return audio[key];}
 function syncVolume(){for(const [key,a] of Object.entries(audio))a.volume=muted?0:key==='pasha'?vol.se:vol.bgm;}
-function playMusic(){if(!unlocked)return;const a=getAudio(track);syncVolume();a.play().then(()=>$('#audioUnlock').classList.remove('show')).catch(()=>$('#audioUnlock').classList.add('show'));}
+function playMusic(){if(!unlocked||audioSuspended||document.hidden)return;const a=getAudio(track);syncVolume();if(!a.paused)return;a.play().then(()=>{if(audioSuspended||document.hidden||a!==audio[track])a.pause();else $('#audioUnlock').classList.remove('show');}).catch(()=>{if(!audioSuspended&&!document.hidden)$('#audioUnlock').classList.add('show');});}
 function music(key){if(track!==key){if(audio[track]){audio[track].pause();audio[track].currentTime=0;}track=key;}playMusic();}
 function unlock(){if(!unlocked){unlocked=true;playMusic();}}
 document.addEventListener('pointerdown',unlock,{passive:true});document.addEventListener('keydown',unlock);
 $('#audioUnlock').onclick=()=>{unlocked=true;playMusic();};
-function se(){if(!unlocked)return;const a=getAudio('pasha');a.currentTime=0;syncVolume();a.play().catch(()=>{});}
+function se(){if(!unlocked||audioSuspended||document.hidden)return;const a=getAudio('pasha');a.currentTime=0;syncVolume();a.play().then(()=>{if(audioSuspended||document.hidden)a.pause();}).catch(()=>{});}
+function suspendAudio(){audioSuspended=true;for(const a of Object.values(audio))a.pause();}
+function resumeAudio(){if(document.hidden)return;audioSuspended=false;playMusic();}
+document.addEventListener('visibilitychange',()=>document.hidden?suspendAudio():resumeAudio());
+addEventListener('pagehide',suspendAudio);addEventListener('pageshow',resumeAudio);addEventListener('blur',suspendAudio);addEventListener('focus',resumeAudio);
 function soundSettings(){openModal(modalHeader('画質・音量')+`<div class="row"><span>描画品質</span><button id="qualityChoice" aria-pressed="${scene?.quality!=='standard'}">${scene?.quality==='standard'?'標準':'高精細'}</button></div>`+`<p class="note">BGMと効果音は別々に調整できます。</p><div class="volume"><label>BGM <output id="bgmValue">${Math.round(vol.bgm*100)}</output>%<input id="bgmVolume" type="range" min="0" max="100" value="${Math.round(vol.bgm*100)}"></label><label>効果音 <output id="seValue">${Math.round(vol.se*100)}</output>%<input id="seVolume" type="range" min="0" max="100" value="${Math.round(vol.se*100)}"></label></div><div class="row"><button id="muteBtn">${muted?'消音を解除':'すべて消音'}</button><button id="testSe">効果音を試聴</button></div><p class="note" style="margin:15px 0 0">初期音量：BGM 12% ／ 効果音 80%</p>`);
  $('#qualityChoice').onclick=()=>{if(!scene)return;const high=scene.quality!=='high';scene.setQuality(high?'high':'standard');$('#qualityChoice').textContent=high?'高精細':'標準';$('#qualityChoice').setAttribute('aria-pressed',String(high));};
  for(const key of ['bgm','se'])$(`#${key}Volume`).oninput=e=>{vol[key]=Number(e.target.value)/100;$(`#${key}Value`).textContent=e.target.value;syncVolume();try{localStorage.setItem('sengoku-volume',JSON.stringify(vol));}catch{}};
@@ -878,17 +949,20 @@ $('#confirmFormation').onclick=()=>{
 };
 $$('[data-pref]').forEach(b=>b.onclick=()=>{pref=Number(b.dataset.pref);$$('[data-pref]').forEach(x=>x.classList.toggle('active',x===b));});$('#backFormation').onclick=()=>{show('formation');formationRender();};
 $('#confirmOrder').onclick=()=>{if(online){submitOnlineFormation();return;}const matched=pref===cpuPref;first=matched?(Math.random()<.5?1:2):(pref===1?1:2);$('#orderReveal').innerHTML=`あなた：${pref===1?'先手':'後手'}希望 ／ CPU：${cpuPref===1?'先手':'後手'}希望<br><span class="note">${matched?'希望が同じため、50%の抽選で決定しました。':'希望が異なるため、希望通りに決定しました。'}</span><strong>あなたは${first===1?'先手':'後手'}</strong>`;$$('[data-pref]').forEach(b=>b.disabled=true);$('#confirmOrder').hidden=true;$('#backFormation').hidden=true;$('#startBattle').hidden=false;};
-$('#startBattle').onclick=async()=>{if(online){onlineReady();return;}resetVisual();state=E.initial(formation,cpuFormation,first);logs?.start(E,state,{matchType:'human_cpu',cpuSide:2,cpuDifficulty:difficulty,cpuLevelName:E.difficultyNames[difficulty]});over=false;busy=true;selected=null;lastMove=null;history=[];turnAnalysis=null;lastActivity=Date.now();$('#yourOrder').textContent=`あなた · ${first===1?'先手':'後手'}`;$('#cpuOrder').textContent=`CPU：${E.difficultyNames[difficulty]} · ${first===2?'先手':'後手'}`;$('#turnNotice').textContent=first===1?'あなたの手番です':'CPUの手番です';$('#turnNotice').classList.remove('arrived');show('game');music('normal');$('#boardStage').hidden=false;const version=epoch;await ensureScene($('#boardStage'),'board');if(version!==epoch)return;$('#boardStage').hidden=!scene;$('#board').classList.toggle('accessible-board',!!scene);$('#cameraHelp').hidden=!scene;if(scene){scene.setTop(false);scene.yaw=0;scene.elevation=72;scene.placeCamera();scene.tween(450,u=>{scene.elevation=72-14*u;scene.placeCamera();});$('#viewToggle').textContent='上空';$('#viewToggle').setAttribute('aria-pressed','false');$('#viewToggle').setAttribute('aria-label','上空視点へ切替');}render();analyzeTurn();};
+$('#startBattle').onclick=async()=>{if(online){onlineReady();return;}resetVisual();cpuContext={positions:[],moves:[]};cpuContextPly=-1;state=E.initial(formation,cpuFormation,first);logs?.start(E,state,{matchType:'human_cpu',cpuSide:2,cpuDifficulty:difficulty,cpuLevelName:E.difficultyNames[difficulty]});over=false;busy=true;selected=null;lastMove=null;history=[];turnAnalysis=null;lastActivity=Date.now();$('#yourOrder').textContent=`あなた · ${first===1?'先手':'後手'}`;$('#cpuOrder').textContent=`CPU：${E.difficultyNames[difficulty]} · ${first===2?'先手':'後手'}`;$('#turnNotice').textContent=first===1?'あなたの手番です':'CPUの手番です';$('#turnNotice').classList.remove('arrived');show('game');music('normal');$('#boardStage').hidden=false;const version=epoch;await ensureScene($('#boardStage'),'board');if(version!==epoch)return;$('#boardStage').hidden=!scene;$('#board').classList.toggle('accessible-board',!!scene);$('#cameraHelp').hidden=!scene;if(scene){scene.setTop(false);scene.yaw=0;scene.elevation=72;scene.placeCamera();scene.tween(450,u=>{scene.elevation=72-14*u;scene.placeCamera();});$('#viewToggle').textContent='上空';$('#viewToggle').setAttribute('aria-pressed','false');$('#viewToggle').setAttribute('aria-label','上空視点へ切替');}render();analyzeTurn();};
 $('#hostBtn').onclick=()=>onlineLobby(true);$('#joinBtn').onclick=()=>onlineLobby(false);
 const armyGroups=[['horse','騎馬','horse'],['ninja','忍','ninja'],['merc','傭兵','coin'],['general','武将','general'],['lord','殿','fan'],['horo','母衣','horo'],['foot3','弓','bow'],['foot1','槍','spear'],['foot2','刀','sword']];
 function renderArmy(side,el){el.innerHTML=armyGroups.map(([g,label,ic])=>{const n=state.pieces.filter(p=>p.side===side&&(g.startsWith('foot')?p.type===g:E.T[p.type].group===g)).length;return `<div class="army-item ${n?'':'zero'}" aria-label="${label} ${n}枚">${icon(ic)}<span class="army-name">${label}</span><span class="num">${n}</span></div>`;}).join('');}
-function render(){if(!state)return;
+let renderCache=null;
+function boardView(){if(renderCache?.state===state)return renderCache;return renderCache={state,occupied:new Map(state.pieces.map(p=>[p.x+','+p.y,p])),threats:E.attackMap(state,2),danger:E.pasha(state,1),cpudanger:E.pasha(state,2),legals:new Map()};}
+function selectedLegal(p){const v=boardView();if(!v.legals.has(p.id))v.legals.set(p.id,E.legal(state,p));return v.legals.get(p.id);}
+function render(){if(!state)return;const view=boardView();
  const active=state.pieces.find(p=>p.id===selected),marks=new Map();if(active)E.raw(state,active,true).forEach(m=>marks.set(`${m.x},${m.y}`,m.c));
- const threats=state.turn===1&&!over?E.attackMap(state,2):new Set();
- const board=$('#board');board.innerHTML='';for(let y=0;y<9;y++)for(let x=0;x<9;x++){const p=E.at(state,x,y),b=document.createElement('button'),mark=marks.get(`${x},${y}`);b.className='sq'+(pendingMove&&pendingMove.x===x&&pendingMove.y===y?' pending':'')+(mark?' '+mark:'')+(active&&active.x===x&&active.y===y?' sel':'')+(lastMove&&lastMove.x===x&&lastMove.y===y?' last':'')+(threats.has(`${x},${y}`)?' threat':'')+(lastMove?.side===2&&lastMove.x===x&&lastMove.y===y?' cpu-to'+(Date.now()<cpuEffectUntil?' cpu-flash':''):'')+(lastMove?.side===2&&lastMove.fromX===x&&lastMove.fromY===y?' cpu-from':'');b.type='button';b.dataset.x=x;b.dataset.y=y;b.setAttribute('aria-label',`${coord(x,y)} ${p?(p.side===1?'自軍 ':'敵軍 ')+E.T[p.type].name:'空きマス'}${threats.has(`${x},${y}`)?' 敵の攻撃範囲':''}${mark?' '+({r:'移動・攻撃範囲',b:'移動範囲',y:'攻撃範囲'}[mark]):''}`);b.innerHTML=(p?token(p.type,p.side,p.facing):'')+(x===8?`<span class="coord">${y+1}</span>`:'');b.onclick=()=>tap(x,y);board.appendChild(b);}
- if(scene&&screen==='game'&&scene.mode==='board')scene.update(state,selected,marks,threats,active?.side===state.turn&&!busy&&!over?E.legal(state,active):[],lastMove,pendingMove);$('#pieceReadout').hidden=!active;$('#piecePattern').innerHTML=active?pattern(active.type):'';
- renderArmy(2,$('#oppArmy'));renderArmy(1,$('#myArmy'));$('#moveCount').textContent=`${state.ply}手`;
- const danger=E.pasha(state,1),cpudanger=E.pasha(state,2);$('#status').classList.toggle('danger',danger||cpudanger);
+ const threats=state.turn===1&&!over?view.threats:new Set();
+ const board=$('#board');for(let y=0;y<9;y++)for(let x=0;x<9;x++){const p=view.occupied.get(`${x},${y}`),b=board.children[y*9+x]||document.createElement('button'),mark=marks.get(`${x},${y}`);b.className='sq'+(pendingMove&&pendingMove.x===x&&pendingMove.y===y?' pending':'')+(mark?' '+mark:'')+(active&&active.x===x&&active.y===y?' sel':'')+(lastMove&&lastMove.x===x&&lastMove.y===y?' last':'')+(threats.has(`${x},${y}`)?' threat':'')+(lastMove?.side===2&&lastMove.x===x&&lastMove.y===y?' cpu-to'+(Date.now()<cpuEffectUntil?' cpu-flash':''):'')+(lastMove?.side===2&&lastMove.fromX===x&&lastMove.fromY===y?' cpu-from':'');b.type='button';b.dataset.x=x;b.dataset.y=y;b.setAttribute('aria-label',`${coord(x,y)} ${p?(p.side===1?'自軍 ':'敵軍 ')+E.T[p.type].name:'空きマス'}${threats.has(`${x},${y}`)?' 敵の攻撃範囲':''}${mark?' '+({r:'移動・攻撃範囲',b:'移動範囲',y:'攻撃範囲'}[mark]):''}`);const contents=(p?`${p.id}:${p.type}:${p.side}:${p.facing}`:'empty');if(b.dataset.contents!==contents){b.innerHTML=(p?token(p.type,p.side,p.facing):'')+(x===8?`<span class="coord">${y+1}</span>`:'');b.dataset.contents=contents;}if(!b.parentNode){b.onclick=()=>tap(x,y);board.appendChild(b);}}
+ if(scene&&screen==='game'&&scene.mode==='board')scene.update(state,selected,marks,threats,active?.side===state.turn&&!busy&&!over?selectedLegal(active):[],lastMove,pendingMove);$('#pieceReadout').hidden=!active;if($('#piecePattern').dataset.type!==(active?.type||'')){$('#piecePattern').innerHTML=active?pattern(active.type):'';$('#piecePattern').dataset.type=active?.type||'';}
+ if(view.armyRendered!==true){renderArmy(2,$('#oppArmy'));renderArmy(1,$('#myArmy'));view.armyRendered=true;}$('#moveCount').textContent=`${state.ply}手`;
+ const danger=view.danger,cpudanger=view.cpudanger;$('#status').classList.toggle('danger',danger||cpudanger);
  $('#status b').textContent=over?'対局終了':busy?(online?'相手の手番／通信を確認中…':state.turn===2?'CPU 思考中…':'局面を確認中…'):(state.turn===1?'あなたの手番':online?'相手の手番':'CPUの手番');
  $('#status span').textContent=over?'':danger?'自軍の殿がパーシャ':cpudanger?'敵軍の殿がパーシャ':turnAnalysis?.canBuild?'ビルドパーシャ可能':turnAnalysis?.canPasha?'パーシャ可能':'';
  if(turnAnalysis&&!over&&(danger||cpudanger)){const hints=[turnAnalysis.canBuild?'ビルドパーシャ可能':'',turnAnalysis.canPasha?'パーシャ可能':''].filter(Boolean);if(hints.length)$('#status span').textContent+=' ／ '+hints.join('・');}
@@ -902,12 +976,12 @@ function tap(x,y){if(over||!state||animating)return;const q=E.at(state,x,y),p=st
 function toast(text){clearTimeout(toastTimer);$('#toast').textContent=text;$('#toast').hidden=false;toastTimer=setTimeout(()=>$('#toast').hidden=true,2100);}
 async function makeMove(m){if(!state||over||animating||!m)return;const p=state.pieces.find(p=>p.id===m.id);if(!p||p.side!==state.turn||!E.legal(state,p).some(a=>a.x===m.x&&a.y===m.y))return;
  if(online){await sendOnlineMove(m);return;}pendingMove=null;const version=epoch;animating=true;busy=true;const victim=E.at(state,m.x,m.y);if(scene&&scene.mode==='board'){const completed=await scene.animateMove(p,m,victim);if(!completed||version!==epoch||over||!state){animating=false;return;}}animating=false;
- const before={1:E.pasha(state,1),2:E.pasha(state,2)},q=E.at(state,m.x,m.y),from=coord(p.x,p.y);history.push(`${state.ply+1}手目 · ${p.side===1?'あなた':'CPU'} ${E.T[p.type].name} ${from} → ${coord(m.x,m.y)}${q?' ／ '+E.T[q.type].name+'を撃破':''}`);if(p.side===1){document.querySelector("#turnNotice").textContent='CPUが応手を検討しています…';document.querySelector("#turnNotice").classList.remove('arrived');}const logBefore=state;state=E.apply(state,m);if(!online)logs?.move(logBefore,m,state);lastMove={x:m.x,y:m.y,fromX:p.x,fromY:p.y,side:p.side};if(p.side===2){cpuEffectUntil=Date.now()+1200;$('#turnNotice').textContent=`CPU：${E.T[p.type].name} ${from} → ${coord(m.x,m.y)}${q?' ／ '+E.T[q.type].name+'を撃破':''} ｜ あなたの手番`;$('#turnNotice').classList.remove('arrived');void $('#turnNotice').offsetWidth;$('#turnNotice').classList.add('arrived');}selected=null;busy=true;turnAnalysis=null;
+ const before={1:E.pasha(state,1),2:E.pasha(state,2)},q=E.at(state,m.x,m.y),from=coord(p.x,p.y);history.push(`${state.ply+1}手目 · ${p.side===1?'あなた':'CPU'} ${E.T[p.type].name} ${from} → ${coord(m.x,m.y)}${q?' ／ '+E.T[q.type].name+'を撃破':''}`);if(p.side===1){document.querySelector("#turnNotice").textContent='CPUが応手を検討しています…';document.querySelector("#turnNotice").classList.remove('arrived');}const logBefore=state;cpuContext.moves.push({id:p.id,side:p.side,x:m.x,y:m.y});if(cpuContext.moves.length>32)cpuContext.moves.shift();state=E.apply(state,m);if(!online)logs?.move(logBefore,m,state);lastMove={x:m.x,y:m.y,fromX:p.x,fromY:p.y,side:p.side};if(p.side===2){cpuEffectUntil=Date.now()+1200;$('#turnNotice').textContent=`CPU：${E.T[p.type].name} ${from} → ${coord(m.x,m.y)}${q?' ／ '+E.T[q.type].name+'を撃破':''} ｜ あなたの手番`;$('#turnNotice').classList.remove('arrived');void $('#turnNotice').offsetWidth;$('#turnNotice').classList.add('arrived');}selected=null;busy=true;turnAnalysis=null;
  if(!E.lord(state,state.turn)){render();finish(3-state.turn,'殿を撃破');return;}
  const newly=[1,2].filter(side=>!before[side]&&E.pasha(state,side));if(newly.length){toast('パーシャ');se();history.push('パーシャ成立');}
  render();analyzeTurn();
 }
-function computeTurn(s,level,progress=()=>{}){const deadline=performance.now()+900;if(E.isDraw(s))return {draw:true,winner:0,reason:'両軍とも殿だけになりました',analysis:null,move:null};const mover=3-s.turn;let winner=0,reason='';if(E.build(s,mover)){winner=mover;reason='ビルドパーシャ成立';}else if(E.build(s,s.turn)){winner=s.turn;reason='ビルドパーシャ成立';}const analysis=winner?null:E.analyze(s,s.turn);if(!winner&&!analysis.count){winner=3-s.turn;reason='合法手がありません';}const result={winner,reason,analysis,move:null};if(!winner&&s.turn===2){result.move=E.all(s,2)[0]||null;progress({...result});result.move=E.chooseDifficulty(s,2,level,Math.max(1,deadline-performance.now()));}return result;}
+function computeTurn(s,level,progress=()=>{},context={}){const deadline=performance.now()+900;if(E.isDraw(s))return {draw:true,winner:0,reason:'両軍とも殿だけになりました',analysis:null,move:null};const mover=3-s.turn;let winner=0,reason='';if(E.build(s,mover)){winner=mover;reason='ビルドパーシャ成立';}else if(E.build(s,s.turn)){winner=s.turn;reason='ビルドパーシャ成立';}const analysis=winner?null:E.analyze(s,s.turn);if(!winner&&!analysis.count){winner=3-s.turn;reason='合法手がありません';}const result={winner,reason,analysis,move:null};if(!winner&&s.turn===2){result.move=E.chooseDifficulty(s,2,level,Math.max(1,deadline-performance.now()),context,move=>progress({...result,move}));}return result;}
 function finishBlockedTurn(){
  if(!state||over||E.all(state,state.turn).length)return false;
  // Preserve draw/build precedence, but do not wait for the CPU worker to end a blocked turn.
@@ -916,11 +990,11 @@ function finishBlockedTurn(){
  return true;
 }
 function analyzeTurn(){
- if(online){onlineAnalyze();return;}if(finishBlockedTurn())return;cancelJobs();const id=job,started=performance.now();busy=true;
+ if(online){onlineAnalyze();return;}if(finishBlockedTurn())return;if(cpuContextPly!==state.ply){cpuContext.positions.push(E.positionKey(state));if(cpuContext.positions.length>24)cpuContext.positions.shift();cpuContextPly=state.ply;}cancelJobs();const id=job,started=performance.now();busy=true;
  const receive=r=>{clearTimeout(cpuTimer);if(id!==job||!state||over||screen!=='game')return;if(worker){worker.terminate();worker=null;}if(r.winner||r.draw){finish(r.winner,r.reason);return;}turnAnalysis=r.analysis;music(r.analysis.canPasha||r.analysis.canBuild?'tension':'normal');busy=state.turn===2;render();if(state.turn===2)cpuTimer=setTimeout(()=>{if(id===job&&!over)makeMove(r.move);},Math.max(0,350-(performance.now()-started)));};
- const source=$('#engineCode').textContent+'\nconst E=Engine;\n'+computeTurn.toString()+'\nonmessage=e=>{try{postMessage({ok:true,result:computeTurn(e.data.state,e.data.level,result=>postMessage({progress:true,result}))})}catch(err){postMessage({ok:false,error:String(err)})}};';
- try{const url=URL.createObjectURL(new Blob([source],{type:'text/javascript'}));worker=new Worker(url);URL.revokeObjectURL(url);worker.onmessage=e=>{if(e.data.progress){clearTimeout(cpuTimer);cpuTimer=setTimeout(()=>receive(e.data.result),Math.max(0,950-(performance.now()-started)));return;}if(e.data.ok)receive(e.data.result);else failAnalysis(e.data.error);};worker.onerror=e=>{if(id===job){worker?.terminate();worker=null;fallback();}};worker.postMessage({state,level:difficulty});}catch{fallback();}
- function fallback(){setTimeout(()=>{if(id!==job)return;try{receive(computeTurn(state,difficulty));}catch(e){failAnalysis(String(e));}},30);}
+ const source=$('#engineCode').textContent+'\nconst E=Engine;\n'+computeTurn.toString()+'\nonmessage=e=>{try{postMessage({ok:true,result:computeTurn(e.data.state,e.data.level,result=>postMessage({progress:true,result}),e.data.context)})}catch(err){postMessage({ok:false,error:String(err)})}};';
+ try{const url=URL.createObjectURL(new Blob([source],{type:'text/javascript'}));worker=new Worker(url);URL.revokeObjectURL(url);worker.onmessage=e=>{if(e.data.progress){clearTimeout(cpuTimer);cpuTimer=setTimeout(()=>receive(e.data.result),Math.max(0,950-(performance.now()-started)));return;}if(e.data.ok)receive(e.data.result);else failAnalysis(e.data.error);};worker.onerror=e=>{if(id===job){worker?.terminate();worker=null;fallback();}};worker.postMessage({state,level:difficulty,context:cpuContext});}catch{fallback();}
+ function fallback(){setTimeout(()=>{if(id!==job)return;try{receive(computeTurn(state,difficulty,()=>{},cpuContext));}catch(e){failAnalysis(String(e));}},30);}
 }
 function failAnalysis(error){cancelJobs();busy=true;openModal(modalHeader('局面を再確認')+'<p>局面の解析を完了できませんでした。盤面は保持しています。</p><button id="retryAnalysis" class="primary">解析を再試行</button>');$('#retryAnalysis').onclick=()=>{closeModal();analyzeTurn();};console.error(error);}
 async function finish(winner,reason){if(!state||over)return;if(online&&!onlineFinishing){await onlineAction(()=>online.end(reason));return;}if(!online)logs?.end(state,winner,reason);over=true;busy=false;resetVisual();cancelJobs();$('#idle').hidden=true;$('#toast').hidden=true;music('result');$('#turnNotice').textContent=winner===0?'引き分けで対局終了':'対局終了';history.push(`終局 · ${winner===0?'引き分け':(winner===1?'あなた':online?'相手':'CPU')+'の勝利'}：${reason}`);render();const version=epoch;if(reason==='ビルドパーシャ成立'){if(scene)await scene.surround(3-winner);if(version!==epoch)return;$('#toast').classList.add('build');toast('ビルドパーシャ');await new Promise(r=>setTimeout(r,850));$('#toast').classList.remove('build');if(version!==epoch)return;}openModal(`<div class="eyebrow center">BATTLE RESULT</div><div class="result-mark">${winner===0?'引き分け':winner===1?'勝利':'敗北'}</div><p class="result-reason">${reason}</p><p class="note center">${state.ply}手で終局</p><div class="stack"><button id="rematch" class="primary">再戦 · 殿の抽選から</button><button id="resultHome">トップへ戻る</button></div>`,'result');$('#rematch').onclick=online?requestOnlineRematch:beginDraw;$('#resultHome').onclick=goHome;}
