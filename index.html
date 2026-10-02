@@ -899,18 +899,21 @@ document.addEventListener('keydown',e=>{
 const audioData=JSON.parse($('#audioData').textContent),audio={},vol={bgm:.12,se:.8};
 let track='waiting',unlocked=false,muted=false,audioSuspended=document.hidden;
 try{const v=JSON.parse(localStorage.getItem('sengoku-volume')||'null');if(v){vol.bgm=Math.max(0,Math.min(1,Number(v.bgm)||0));vol.se=Math.max(0,Math.min(1,Number(v.se)||0));}}catch{}
-function getAudio(key){if(!audio[key]){audio[key]=new Audio(audioData[key]);audio[key].id='audio-'+key;audio[key].hidden=true;document.body.appendChild(audio[key]);audio[key].loop=key!=='pasha';audio[key].preload='none';audio[key].addEventListener('error',()=>{$('#audioUnlock').textContent='音源を再生できませんでした';$('#audioUnlock').classList.add('show');});}return audio[key];}
+function pauseAudio(a){a.pause();try{navigator.mediaSession&&(navigator.mediaSession.playbackState='none');}catch{}}
+function getAudio(key){if(!audio[key]){audio[key]=new Audio(audioData[key]);audio[key].id='audio-'+key;audio[key].hidden=true;document.body.appendChild(audio[key]);audio[key].loop=key!=='pasha';audio[key].preload='none';const stopIfInactive=()=>{if(audioSuspended||document.visibilityState!=='visible')pauseAudio(audio[key]);};audio[key].addEventListener('play',stopIfInactive);audio[key].addEventListener('playing',stopIfInactive);audio[key].addEventListener('error',()=>{$('#audioUnlock').textContent='音源を再生できませんでした';$('#audioUnlock').classList.add('show');});}return audio[key];}
 function syncVolume(){for(const [key,a] of Object.entries(audio))a.volume=muted?0:key==='pasha'?vol.se:vol.bgm;}
 function playMusic(){if(!unlocked||audioSuspended||document.hidden)return;const a=getAudio(track);syncVolume();if(!a.paused)return;a.play().then(()=>{if(audioSuspended||document.hidden||a!==audio[track])a.pause();else $('#audioUnlock').classList.remove('show');}).catch(()=>{if(!audioSuspended&&!document.hidden)$('#audioUnlock').classList.add('show');});}
-function music(key){if(track!==key){if(audio[track]){audio[track].pause();audio[track].currentTime=0;}track=key;}playMusic();}
-function unlock(){if(!unlocked){unlocked=true;playMusic();}}
+function music(key){if(track!==key){if(audio[track]){pauseAudio(audio[track]);audio[track].currentTime=0;}track=key;}playMusic();}
+function unlock(){if(!unlocked)unlocked=true;if(audioSuspended&&!document.hidden)return;playMusic();}
 document.addEventListener('pointerdown',unlock,{passive:true});document.addEventListener('keydown',unlock);
 $('#audioUnlock').onclick=()=>{unlocked=true;playMusic();};
-function se(){if(!unlocked||audioSuspended||document.hidden)return;const a=getAudio('pasha');a.currentTime=0;syncVolume();a.play().then(()=>{if(audioSuspended||document.hidden)a.pause();}).catch(()=>{});}
-function suspendAudio(){audioSuspended=true;for(const a of Object.values(audio))a.pause();}
-function resumeAudio(){if(document.hidden)return;audioSuspended=false;playMusic();}
+function se(){if(!unlocked||audioSuspended||document.hidden)return;const a=getAudio('pasha');a.currentTime=0;syncVolume();a.play().then(()=>{if(audioSuspended||document.hidden)pauseAudio(a);}).catch(()=>{});}
+function suspendAudio(){audioSuspended=true;for(const a of Object.values(audio))pauseAudio(a);setTimeout(()=>{if(audioSuspended)for(const a of Object.values(audio))pauseAudio(a);},0);}
+// A foreground transition does not start sound on its own. The next real user gesture
+// resumes it, preventing Android focus/pageshow races from leaving BGM playing in background.
+function resumeAudio(){if(document.hidden)return;audioSuspended=false;}
 document.addEventListener('visibilitychange',()=>document.hidden?suspendAudio():resumeAudio());
-addEventListener('pagehide',suspendAudio);addEventListener('pageshow',resumeAudio);addEventListener('blur',suspendAudio);addEventListener('focus',resumeAudio);
+addEventListener('pagehide',suspendAudio);addEventListener('beforeunload',suspendAudio);addEventListener('unload',suspendAudio);addEventListener('freeze',suspendAudio);addEventListener('blur',suspendAudio);addEventListener('pageshow',resumeAudio);addEventListener('focus',resumeAudio);
 function soundSettings(){openModal(modalHeader('画質・音量')+`<div class="row"><span>描画品質</span><button id="qualityChoice" aria-pressed="${scene?.quality!=='standard'}">${scene?.quality==='standard'?'標準':'高精細'}</button></div>`+`<p class="note">BGMと効果音は別々に調整できます。</p><div class="volume"><label>BGM <output id="bgmValue">${Math.round(vol.bgm*100)}</output>%<input id="bgmVolume" type="range" min="0" max="100" value="${Math.round(vol.bgm*100)}"></label><label>効果音 <output id="seValue">${Math.round(vol.se*100)}</output>%<input id="seVolume" type="range" min="0" max="100" value="${Math.round(vol.se*100)}"></label></div><div class="row"><button id="muteBtn">${muted?'消音を解除':'すべて消音'}</button><button id="testSe">効果音を試聴</button></div><p class="note" style="margin:15px 0 0">初期音量：BGM 12% ／ 効果音 80%</p>`);
  $('#qualityChoice').onclick=()=>{if(!scene)return;const high=scene.quality!=='high';scene.setQuality(high?'high':'standard');$('#qualityChoice').textContent=high?'高精細':'標準';$('#qualityChoice').setAttribute('aria-pressed',String(high));};
  for(const key of ['bgm','se'])$(`#${key}Volume`).oninput=e=>{vol[key]=Number(e.target.value)/100;$(`#${key}Value`).textContent=e.target.value;syncVolume();try{localStorage.setItem('sengoku-volume',JSON.stringify(vol));}catch{}};
