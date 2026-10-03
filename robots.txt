@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://bildsenki.github.io/BUILD-SENKI/sitemap.xml
+Sitemap: https://buildsenki.github.io/BUILD-SENKI/sitemap.xml
